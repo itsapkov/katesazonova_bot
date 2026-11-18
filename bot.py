@@ -1,11 +1,12 @@
 """
-Telegram-бот для курса Кати Сазоновой «КАПСУЛА FW 26/27».
+Telegram-бот Кати Сазоновой — продажа Shopping List через lava.top.
 
-Что делает:
-  · рассказывает о Кате и курсе (несколько экранов с кнопками)
-  · принимает оплату через lava.top: RUB (СБП / карта), EUR и USD (Apple Pay / PayPal / карта)
-  · на каждый выбранный способ создаёт отдельную одноразовую ссылку на оплату
-  · после оплаты сам присылает доступ в этот же чат (вебхук lava.top + фолбэк-опрос)
+Экраны:
+  /start  — приветствие + меню
+  Меню    — О SHOPPING LIST · КУПИТЬ SHOPPING LIST · Написать Кате
+            (+ «Мой Shopping List» для тех, кто уже оплатил)
+  Оплата  — валюта → способ → почта → одноразовая ссылка lava.top
+  После оплаты доступ приходит в чат автоматически (вебхук + опрос-фолбэк).
 
 Запуск: python bot.py
 """
@@ -66,28 +67,23 @@ def kb(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[r for r in rows if r])
 
 
-def menu_kb() -> InlineKeyboardMarkup:
-    return kb(
-        [InlineKeyboardButton(text=texts.BTN_ABOUT, callback_data="about:0")],
-        [InlineKeyboardButton(text=texts.BTN_PROGRAM, callback_data="program")],
-        [InlineKeyboardButton(text=texts.BTN_FAQ, callback_data="faq")],
+async def menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Меню из трёх кнопок; для оплативших добавляется «Мой Shopping List»."""
+    rows = [
+        [InlineKeyboardButton(text=texts.BTN_ABOUT, callback_data="about")],
         [InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")],
-        [InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)],
-    )
-
-
-def about_kb(page: int) -> InlineKeyboardMarkup:
-    total = len(texts.ABOUT_PAGES)
-    rows: list[list[InlineKeyboardButton]] = []
-    if page + 1 < total:
-        rows.append([
-            InlineKeyboardButton(
-                text=f"Дальше · {page + 2}/{total}", callback_data=f"about:{page + 1}"
-            )
-        ])
-    rows.append([InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")])
-    rows.append([InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")])
+    ]
+    if await storage.is_paid(user_id):
+        rows.append([InlineKeyboardButton(text=texts.BTN_MYLINK, callback_data="mylink")])
+    rows.append([InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)])
     return kb(*rows)
+
+
+def about_kb() -> InlineKeyboardMarkup:
+    return kb(
+        [InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")],
+        [InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")],
+    )
 
 
 def currency_kb() -> InlineKeyboardMarkup:
@@ -107,14 +103,9 @@ def currency_kb() -> InlineKeyboardMarkup:
 
 def methods_kb(currency: str) -> InlineKeyboardMarkup:
     labels = {
-        "RUB_SBP": "СБП",
-        "RUB_CARD": "Картой",
-        "EUR_APPLE": "Apple Pay",
-        "EUR_PAYPAL": "PayPal",
-        "EUR_CARD": "Картой",
-        "USD_APPLE": "Apple Pay",
-        "USD_PAYPAL": "PayPal",
-        "USD_CARD": "Картой",
+        "RUB_SBP": "СБП", "RUB_CARD": "Картой",
+        "EUR_APPLE": "Apple Pay", "EUR_PAYPAL": "PayPal", "EUR_CARD": "Картой",
+        "USD_APPLE": "Apple Pay", "USD_PAYPAL": "PayPal", "USD_CARD": "Картой",
     }
     rows = [
         [InlineKeyboardButton(text=labels[key], callback_data=f"m:{key}")]
@@ -124,33 +115,36 @@ def methods_kb(currency: str) -> InlineKeyboardMarkup:
     return kb(*rows)
 
 
-async def show_menu(target: Message | CallbackQuery) -> None:
-    message = target.message if isinstance(target, CallbackQuery) else target
-    await message.answer(texts.MENU, reply_markup=menu_kb())
-
-
 async def edit_or_send(call: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
-    """Пытаемся отредактировать сообщение; если нельзя (например, это фото) — отправляем новое."""
     try:
         await call.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
     except TelegramBadRequest:
         await call.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
 
 
-# --- Хендлеры ---------------------------------------------------------------
+# --- Команды ----------------------------------------------------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await storage.upsert_user(
         message.from_user.id, message.from_user.username, message.from_user.first_name
     )
-    await message.answer(texts.WELCOME, reply_markup=menu_kb(), disable_web_page_preview=True)
+    await message.answer(
+        texts.WELCOME,
+        reply_markup=await menu_kb(message.from_user.id),
+        disable_web_page_preview=True,
+    )
 
 
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await show_menu(message)
+    await message.answer(texts.MENU, reply_markup=await menu_kb(message.from_user.id))
+
+
+@router.message(Command("mylink"))
+async def cmd_mylink(message: Message) -> None:
+    await send_access_again(message, message.from_user.id)
 
 
 @router.message(Command("id"))
@@ -168,48 +162,45 @@ async def cmd_stats(message: Message) -> None:
     )
 
 
+# --- Меню и разделы ---------------------------------------------------------
 @router.callback_query(F.data == "menu")
 async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await edit_or_send(call, texts.MENU, menu_kb())
+    await edit_or_send(call, texts.MENU, await menu_kb(call.from_user.id))
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("about:"))
+@router.callback_query(F.data == "about")
 async def cb_about(call: CallbackQuery) -> None:
-    page = int(call.data.split(":")[1])
-    page = max(0, min(page, len(texts.ABOUT_PAGES) - 1))
-    await edit_or_send(call, texts.ABOUT_PAGES[page], about_kb(page))
+    await edit_or_send(call, texts.ABOUT, about_kb())
     await call.answer()
 
 
-@router.callback_query(F.data == "program")
-async def cb_program(call: CallbackQuery) -> None:
-    await edit_or_send(
-        call,
-        texts.PROGRAM,
-        kb(
-            [InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")],
-            [InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")],
-        ),
-    )
+@router.callback_query(F.data == "mylink")
+async def cb_mylink(call: CallbackQuery) -> None:
     await call.answer()
+    await send_access_again(call.message, call.from_user.id)
 
 
-@router.callback_query(F.data == "faq")
-async def cb_faq(call: CallbackQuery) -> None:
-    await edit_or_send(
-        call,
-        texts.FAQ,
-        kb(
-            [InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")],
-            [InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)],
-            [InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")],
-        ),
-    )
-    await call.answer()
+async def send_access_again(message: Message, user_id: int) -> None:
+    """Повторная выдача ссылки на Shopping List (requirement 8)."""
+    if await storage.is_paid(user_id):
+        await message.answer(
+            texts.access_again(config.ACCESS_URL),
+            reply_markup=kb([InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)]),
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer(
+            texts.NOT_PURCHASED,
+            reply_markup=kb(
+                [InlineKeyboardButton(text=texts.BTN_PAY, callback_data="pay")],
+                [InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")],
+            ),
+        )
 
 
+# --- Оплата -----------------------------------------------------------------
 @router.callback_query(F.data == "pay")
 async def cb_pay(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
@@ -246,7 +237,6 @@ async def cb_method(call: CallbackQuery, state: FSMContext) -> None:
             text=f"Использовать {saved_email}", callback_data="use_saved_email"
         )])
     rows.append([InlineKeyboardButton(text=texts.BTN_BACK, callback_data="pay")])
-
     await edit_or_send(call, texts.EMAIL_PROMPT, kb(*rows))
     await call.answer()
 
@@ -274,29 +264,25 @@ async def on_email(message: Message, state: FSMContext) -> None:
     await create_and_send_invoice(message, message.from_user.id, email, state)
 
 
-async def create_and_send_invoice(
-    message: Message, tg_id: int, email: str, state: FSMContext
-) -> None:
+async def create_and_send_invoice(message: Message, tg_id: int, email: str, state: FSMContext) -> None:
     data = await state.get_data()
     key = data.get("method_key")
     await state.clear()
     if key not in config.PAYMENT_METHODS:
-        await show_menu(message)
+        await message.answer(texts.MENU, reply_markup=await menu_kb(tg_id))
         return
 
     currency, payment_method, label = config.PAYMENT_METHODS[key]
     offer_id = config.OFFER_IDS.get(currency, "")
     if not offer_id:
         log.error("Не задан offerId для валюты %s", currency)
-        await message.answer(texts.PAYMENT_ERROR, reply_markup=menu_kb())
+        await message.answer(texts.PAYMENT_ERROR, reply_markup=await menu_kb(tg_id))
         return
 
     notice = await message.answer("Готовлю ссылку…")
     try:
         invoice = await lava.create_invoice(
-            email=email,
-            offer_id=offer_id,
-            currency=currency,
+            email=email, offer_id=offer_id, currency=currency,
             payment_method=payment_method,
             utm={"utm_source": "telegram_bot", "utm_content": str(tg_id)},
         )
@@ -317,16 +303,12 @@ async def create_and_send_invoice(
     amount_total = invoice.get("amountTotal") or {}
     amount = amount_total.get("amount", PRICES.get(currency))
 
-    await storage.add_invoice(
-        invoice_id, tg_id, email, currency, label, amount, payment_url
-    )
+    await storage.add_invoice(invoice_id, tg_id, email, currency, label, amount, payment_url)
 
     button_text = f"Открыть оплату · {fmt_amount(currency, amount)} · {label}"
     rows = [[InlineKeyboardButton(text=button_text, url=payment_url)]]
     if invoice_id:
-        rows.append([InlineKeyboardButton(
-            text=texts.BTN_CHECK, callback_data=f"check:{invoice_id}"
-        )])
+        rows.append([InlineKeyboardButton(text=texts.BTN_CHECK, callback_data=f"check:{invoice_id}")])
     rows.append([InlineKeyboardButton(text=texts.BTN_OTHER_METHOD, callback_data="pay")])
 
     await notice.edit_text(
@@ -342,7 +324,6 @@ async def cb_check(call: CallbackQuery, bot: Bot) -> None:
     except LavaError:
         await call.answer(texts.NOT_PAID_YET, show_alert=True)
         return
-
     status = str(data.get("status") or "").lower()
     if status in ("completed", "paid", "success", "subscription-active"):
         await call.answer("Оплата найдена!")
@@ -353,7 +334,7 @@ async def cb_check(call: CallbackQuery, bot: Bot) -> None:
 
 @router.message(F.text)
 async def fallback(message: Message) -> None:
-    await message.answer(texts.FALLBACK, reply_markup=menu_kb())
+    await message.answer(texts.FALLBACK, reply_markup=await menu_kb(message.from_user.id))
 
 
 # --- Выдача доступа ---------------------------------------------------------
@@ -372,9 +353,7 @@ async def handle_paid_invoice(bot: Bot, invoice_id: str, source: str = "webhook"
         await bot.send_message(
             tg_id,
             texts.access_granted(config.ACCESS_URL),
-            reply_markup=kb(
-                [InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)],
-            ),
+            reply_markup=kb([InlineKeyboardButton(text=texts.BTN_CONTACT, url=config.CONTACT_URL)]),
             disable_web_page_preview=True,
         )
     except Exception:
@@ -400,7 +379,6 @@ async def handle_failed_invoice(invoice_id: str) -> None:
 
 # --- Вебхук lava.top --------------------------------------------------------
 async def lava_webhook(request: web.Request) -> web.Response:
-    # Мягкая проверка: если lava.top прислала X-Api-Key, он должен совпадать с нашим.
     header_key = request.headers.get("X-Api-Key")
     if header_key and config.LAVA_API_KEY and header_key != config.LAVA_API_KEY:
         return web.Response(status=403, text="forbidden")
@@ -418,7 +396,6 @@ async def lava_webhook(request: web.Request) -> web.Response:
 
     invoice_id = contract_id
     if invoice_id and await storage.get_invoice(invoice_id) is None and email:
-        # Иногда contractId отличается от id счёта — пробуем найти по почте.
         by_email = await storage.latest_invoice_by_email(email)
         if by_email:
             invoice_id = by_email["id"]
@@ -455,7 +432,6 @@ async def run_web_app(bot: Bot) -> web.AppRunner:
 
 # --- Фолбэк: опрос статусов счетов -----------------------------------------
 async def poll_invoices(bot: Bot) -> None:
-    """Если вебхук не настроен (или не дошёл) — проверяем счёта сами."""
     while True:
         await asyncio.sleep(config.POLL_INTERVAL)
         try:
@@ -477,7 +453,6 @@ async def poll_invoices(bot: Bot) -> None:
 
 
 async def refresh_prices() -> None:
-    """Тянем актуальные цены из lava.top, чтобы кнопки не расходились с кассой."""
     global PRICES
     try:
         products = await lava.get_products()
@@ -499,11 +474,7 @@ async def main() -> None:
         raise SystemExit("BOT_TOKEN обязателен. Заполните .env и запустите снова.")
 
     await storage.init()
-
-    bot = Bot(
-        config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
 
@@ -514,6 +485,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать сначала"),
         BotCommand(command="menu", description="Меню"),
+        BotCommand(command="mylink", description="Мой Shopping List"),
         BotCommand(command="id", description="Мой Telegram ID"),
     ])
 
