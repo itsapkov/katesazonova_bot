@@ -1,9 +1,4 @@
-"""
-Минимальный клиент lava.top (gate.lava.top).
-
-Документация: https://gate.lava.top/docs
-Авторизация: заголовок X-Api-Key с ключом из личного кабинета lava.top.
-"""
+"""Минимальный клиент lava.top (gate.lava.top). Авторизация: заголовок X-Api-Key."""
 import logging
 from typing import Any
 
@@ -55,50 +50,35 @@ class LavaClient:
                 raise LavaError(f"lava.top {resp.status}", resp.status, data)
             return data
 
-    # --- Продукты -----------------------------------------------------------
     async def get_products(self) -> Any:
-        """Список продуктов автора вместе с offers и ценами по валютам."""
         return await self._request("GET", "/api/v2/products")
 
-    # --- Счёта --------------------------------------------------------------
     async def create_invoice(
-        self,
-        *,
-        email: str,
-        offer_id: str,
-        currency: str,
-        payment_method: str | None = None,
-        buyer_language: str = "RU",
-        utm: dict | None = None,
+        self, *, email: str, offer_id: str, currency: str,
+        payment_provider: str | None = None, payment_method: str | None = None,
+        buyer_language: str = "RU", utm: dict | None = None,
     ) -> dict:
         """
-        Создаёт одноразовый счёт и возвращает словарь с полями
-        id / status / amountTotal / paymentUrl.
+        Создаёт счёт через актуальный эндпоинт /api/v3/invoice.
+        provider + method задают конкретный способ оплаты, например:
+          СБП       -> provider=PAY2ME,      method=SBP
+          Карта RUB -> provider=SMART_GLOCAL, method=CARD
+          Apple Pay -> provider=UNLIMIT,      method=APPLE_PAY
+          Карта $/€ -> provider=UNLIMIT,      method=CARD
+          PayPal    -> provider=PAYPAL
         """
         body: dict[str, Any] = {
-            "email": email,
-            "offerId": offer_id,
-            "currency": currency,
+            "email": email, "offerId": offer_id, "currency": currency,
             "buyerLanguage": buyer_language,
-            "periodicity": "ONE_TIME",
         }
+        if payment_provider:
+            body["paymentProvider"] = payment_provider
         if payment_method:
             body["paymentMethod"] = payment_method
         if utm:
             body["clientUtm"] = utm
 
-        try:
-            data = await self._request("POST", "/api/v2/invoice", json=body)
-        except LavaError as err:
-            # Некоторые аккаунты не принимают поле periodicity для разовых продуктов —
-            # пробуем ещё раз без него, чтобы не терять покупателя.
-            if err.status == 400 and "periodicity" in body:
-                body.pop("periodicity")
-                log.warning("Повтор запроса счёта без periodicity")
-                data = await self._request("POST", "/api/v2/invoice", json=body)
-            else:
-                raise
-
+        data = await self._request("POST", "/api/v3/invoice", json=body)
         if not isinstance(data, dict) or not data.get("paymentUrl"):
             raise LavaError("В ответе lava.top нет paymentUrl", payload=data)
         return data
@@ -110,36 +90,7 @@ class LavaClient:
         return data
 
 
-def extract_prices(products: Any, offer_id: str | None = None) -> dict[str, int]:
-    """
-    Достаёт цены по валютам из ответа /api/v2/products.
-    Если передан offer_id — берёт цены именно этого оффера, иначе первого найденного.
-    Возвращает, например, {"RUB": 4900, "EUR": 55, "USD": 59}.
-    """
-    offers = find_offer_ids(products)
-    if not offers:
-        return {}
-    chosen = None
-    if offer_id:
-        for _, oid, prices in offers:
-            if oid == offer_id:
-                chosen = prices
-                break
-    if chosen is None:
-        chosen = offers[0][2]
-
-    result: dict[str, int] = {}
-    for currency, amount in chosen.items():
-        if isinstance(amount, (int, float)) and currency in ("RUB", "EUR", "USD"):
-            result[currency] = int(round(float(amount)))
-    return result
-
-
 def find_offer_ids(products: Any) -> list[tuple[str, str, dict]]:
-    """
-    Возвращает [(product_title, offer_id, {currency: price}), ...]
-    Используется скриптом tools/list_offers.py.
-    """
     found: list[tuple[str, str, dict]] = []
 
     def walk(node: Any, title: str = "") -> None:
@@ -166,3 +117,22 @@ def find_offer_ids(products: Any) -> list[tuple[str, str, dict]]:
 
     walk(products)
     return found
+
+
+def extract_prices(products: Any, offer_id: str | None = None) -> dict[str, int]:
+    offers = find_offer_ids(products)
+    if not offers:
+        return {}
+    chosen = None
+    if offer_id:
+        for _, oid, prices in offers:
+            if oid == offer_id:
+                chosen = prices
+                break
+    if chosen is None:
+        chosen = offers[0][2]
+    result: dict[str, int] = {}
+    for currency, amount in chosen.items():
+        if isinstance(amount, (int, float)) and currency in ("RUB", "EUR", "USD"):
+            result[currency] = int(round(float(amount)))
+    return result

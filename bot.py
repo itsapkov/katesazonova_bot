@@ -147,6 +147,16 @@ async def cmd_mylink(message: Message) -> None:
     await send_access_again(message, message.from_user.id)
 
 
+@router.message(Command("email"))
+async def cmd_email(message: Message, state: FSMContext) -> None:
+    """Сменить почту для чека, если в прошлый раз ввели с ошибкой."""
+    await state.set_state(PayFlow.email)
+    await message.answer(
+        texts.EMAIL_CHANGE,
+        reply_markup=kb([InlineKeyboardButton(text=texts.BTN_MENU, callback_data="menu")]),
+    )
+
+
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     await message.answer(texts.my_id(message.from_user.id))
@@ -230,6 +240,8 @@ async def cb_method(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(PayFlow.email)
     await state.update_data(method_key=key)
 
+    # Если почта уже сохранена — показываем кнопку «Использовать …»,
+    # но можно и ввести другую сообщением.
     saved_email = await storage.get_email(call.from_user.id)
     rows = []
     if saved_email:
@@ -248,12 +260,15 @@ async def cb_saved_email(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Почта не найдена, напишите её сообщением", show_alert=True)
         return
     await call.answer()
+    # create_and_send_invoice сам приводит почту к нижнему регистру.
     await create_and_send_invoice(call.message, call.from_user.id, email, state)
 
 
 @router.message(PayFlow.email, F.text)
 async def on_email(message: Message, state: FSMContext) -> None:
-    email = message.text.strip()
+    # lava.top отклоняет адреса с заглавными буквами и пробелами,
+    # поэтому приводим почту к нижнему регистру и убираем пробелы.
+    email = message.text.strip().lower()
     if not EMAIL_RE.match(email):
         await message.answer(
             texts.EMAIL_INVALID,
@@ -261,10 +276,22 @@ async def on_email(message: Message, state: FSMContext) -> None:
         )
         return
     await storage.set_email(message.from_user.id, email)
-    await create_and_send_invoice(message, message.from_user.id, email, state)
+    data = await state.get_data()
+    if data.get("method_key"):
+        # Почту спросили в ходе оплаты — продолжаем к ссылке.
+        await create_and_send_invoice(message, message.from_user.id, email, state)
+    else:
+        # Почту меняли через /email — просто подтверждаем.
+        await state.clear()
+        await message.answer(
+            texts.EMAIL_SAVED.format(email=email),
+            reply_markup=await menu_kb(message.from_user.id),
+        )
 
 
 async def create_and_send_invoice(message: Message, tg_id: int, email: str, state: FSMContext) -> None:
+    # Нормализуем почту: lava.top отклоняет заглавные буквы и пробелы.
+    email = (email or "").strip().lower()
     data = await state.get_data()
     key = data.get("method_key")
     await state.clear()
@@ -272,7 +299,7 @@ async def create_and_send_invoice(message: Message, tg_id: int, email: str, stat
         await message.answer(texts.MENU, reply_markup=await menu_kb(tg_id))
         return
 
-    currency, payment_method, label = config.PAYMENT_METHODS[key]
+    currency, payment_provider, payment_method, label = config.PAYMENT_METHODS[key]
     offer_id = config.OFFER_IDS.get(currency, "")
     if not offer_id:
         log.error("Не задан offerId для валюты %s", currency)
@@ -283,7 +310,7 @@ async def create_and_send_invoice(message: Message, tg_id: int, email: str, stat
     try:
         invoice = await lava.create_invoice(
             email=email, offer_id=offer_id, currency=currency,
-            payment_method=payment_method,
+            payment_provider=payment_provider, payment_method=payment_method,
             utm={"utm_source": "telegram_bot", "utm_content": str(tg_id)},
         )
     except LavaError as err:
@@ -486,6 +513,7 @@ async def main() -> None:
         BotCommand(command="start", description="Начать сначала"),
         BotCommand(command="menu", description="Меню"),
         BotCommand(command="mylink", description="Мой Shopping List"),
+        BotCommand(command="email", description="Сменить почту для чека"),
         BotCommand(command="id", description="Мой Telegram ID"),
     ])
 
